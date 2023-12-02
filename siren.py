@@ -17,12 +17,13 @@ import os
 from skimage import io
 
 from PIL import Image
-from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 import numpy as np
 import skimage
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from dataclasses import dataclass
+from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 import argparse
+import scipy.ndimage
 from typing import List, Union
 
 import time
@@ -185,18 +186,21 @@ class Image3d(Dataset):
         return self.img
 
 class Implicit3DWrapper(torch.utils.data.Dataset):
-    def __init__(self, dataset, sidelength=None, sample_fraction=1.):
+    def __init__(self, dataset, sidelength=None, compute_diff=None, sample_fraction=1.):
         if isinstance(sidelength, int):
             sidelength = 3 * (sidelength,)
 
+        self.compute_diff = compute_diff
         self.dataset = dataset
         self.mgrid = get_mgrid(sidelength, dim=3)
 
-        # Assuming the first item in the dataset is a 3D grayscale image
-        data = torch.from_numpy(self.dataset[0]).unsqueeze(0).float()  # Add a batch dimension
-        self.data = (data - 0.5) / 0.5  # Normalize to [-1, 1]
         self.sample_fraction = sample_fraction
         self.N_samples = int(self.sample_fraction * self.mgrid.shape[0])
+
+        self.transform = Compose([
+            ToTensor(),
+            Normalize(torch.Tensor([0.5]), torch.Tensor([0.5]), torch.Tensor([0.5]))
+        ])
 
     def __len__(self):
         return len(self.dataset)
@@ -204,11 +208,14 @@ class Implicit3DWrapper(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self.sample_fraction < 1.:
             coord_idx = torch.randint(0, self.data.shape[0], (self.N_samples,))
-            data = self.data[coord_idx, ...]
+            data = self.dataset[coord_idx, ...]
             coords = self.mgrid[coord_idx, ...]
         else:
             coords = self.mgrid
-            data = self.data
+            # transfrom ground truth data into tensor
+            data = self.transform(self.dataset[idx])
+            print(data.shape)
+            data = data.permute(1, 2, 0).contiguous().view(-1, self.dataset.channels)
 
         in_dict = {'idx': idx, 'coords': coords}
         gt_dict = {'img': data}
@@ -217,54 +224,41 @@ class Implicit3DWrapper(torch.utils.data.Dataset):
 
 """# Run the Experiment"""
 
-img = Image3d('/small_cube_100.tif')
+img = Image3d('./data/small_cube_100.tif')
 coord = Implicit3DWrapper(img, sidelength=100, sample_fraction=1.)
 img_resolution = (100, 100, 100)
 
 dataloader = DataLoader(coord, batch_size=1, pin_memory=True, num_workers=0)
 
 features = 100 * 100 * 100
-img_3d_siren = Siren(in_features=features, hidden_features=256, hidden_layers=5, out_features=1, outermost_linear=True, first_omega_0=30)
-# img_3d_siren.cuda()
+img_3d_siren = Siren(in_features=3, hidden_features=256, hidden_layers=5, out_features=1, outermost_linear=True, first_omega_0=30)
+img_3d_siren.cuda()
 
 total_steps = 500
 steps_til_summary = 10
 
 # Assuming your Siren3D model takes 3D coordinates as input
 model_input, ground_truth = next(iter(dataloader))
-# model_input, ground_truth = model_input.cuda(), ground_truth.cuda()
-
+model_input, ground_truth = model_input.cuda(), ground_truth.cuda()
+print(model_input.shape)
+print(ground_truth.shape)
+torch.cuda.empty_cache()
 optim = torch.optim.Adam(lr=1e-4, params=img_3d_siren.parameters())
 
 for step in range(total_steps):
-    model_output, coords = img_3d_siren(model_input)
-
-    # Assuming ground_truth is a 3D tensor (adjust accordingly)
-    loss = F.mse_loss(model_output, ground_truth)
-
+    model_output, coords = img_3d_siren(model_input)    
+    loss = ((model_output - ground_truth)**2).mean()
+    torch.cuda.empty_cache()
     if not step % steps_til_summary:
-        print("Step %d, Total loss %0.6f" % (step, loss.item()))
-
-        # Assuming you have a function to compute gradients and Laplacian for 3D data
+        print("Step %d, Total loss %0.6f" % (step, loss))
         img_grad = gradient(model_output, coords)
         img_laplacian = laplace(model_output, coords)
 
-        # Plotting code (you might need to adjust for 3D visualization)
-        fig = plt.figure(figsize=(18, 6))
-
-        ax1 = fig.add_subplot(131, projection='3d')
-        ax1.scatter(coords[:, 0].cpu().numpy(), coords[:, 1].cpu().numpy(), coords[:, 2].cpu().numpy(), c=model_output.cpu().view(-1).detach().numpy())
-        ax1.set_title('Model Output')
-
-        ax2 = fig.add_subplot(132, projection='3d')
-        ax2.scatter(coords[:, 0].cpu().numpy(), coords[:, 1].cpu().numpy(), coords[:, 2].cpu().numpy(), c=img_grad.norm(dim=-1).cpu().view(-1).detach().numpy())
-        ax2.set_title('Gradient Norm')
-
-        ax3 = fig.add_subplot(133, projection='3d')
-        ax3.scatter(coords[:, 0].cpu().numpy(), coords[:, 1].cpu().numpy(), coords[:, 2].cpu().numpy(), c=img_laplacian.cpu().view(-1).detach().numpy())
-        ax3.set_title('Laplacian')
-
-        plt.show()
+        # fig, axes = plt.subplots(1,3, figsize=(18,6))
+        # axes[0].imshow(model_output.cpu().view(256,256).detach().numpy())
+        # axes[1].imshow(img_grad.norm(dim=-1).cpu().view(256,256).detach().numpy())
+        # axes[2].imshow(img_laplacian.cpu().view(256,256).detach().numpy())
+        # plt.show()
 
     optim.zero_grad()
     loss.backward()
